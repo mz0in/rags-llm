@@ -1,10 +1,11 @@
-from llama_index.llms import OpenAI, ChatMessage
+from llama_index.llms import OpenAI, ChatMessage, Anthropic, Replicate
 from llama_index.llms.base import LLM
 from llama_index.llms.utils import resolve_llm
 from pydantic import BaseModel, Field
 import os
 from llama_index.tools.query_engine import QueryEngineTool
 from llama_index.agent import OpenAIAgent, ReActAgent
+from llama_index.agent.react.prompts import REACT_CHAT_SYSTEM_HEADER
 from llama_index import (
     VectorStoreIndex,
     SummaryIndex,
@@ -19,11 +20,38 @@ from llama_index.tools import QueryEngineTool, ToolMetadata, FunctionTool
 from llama_index.agent.types import BaseAgent
 from llama_index.agent.react.formatter import ReActChatFormatter
 from llama_index.llms.openai_utils import is_function_calling_model
+from llama_index.chat_engine import CondensePlusContextChatEngine
 from builder_config import BUILDER_LLM
 from typing import Dict, Tuple, Any
 import streamlit as st
 from pathlib import Path
 import json
+
+
+def _resolve_llm(llm: str) -> LLM:
+    """Resolve LLM."""
+    # TODO: make this less hardcoded with if-else statements
+    # see if there's a prefix
+    # - if there isn't, assume it's an OpenAI model
+    # - if there is, resolve it
+    tokens = llm.split(":")
+    if len(tokens) == 1:
+        os.environ["OPENAI_API_KEY"] = st.secrets.openai_key
+        llm = OpenAI(model=llm)
+    elif tokens[0] == "local":
+        llm = resolve_llm(llm)
+    elif tokens[0] == "openai":
+        os.environ["OPENAI_API_KEY"] = st.secrets.openai_key
+        llm = OpenAI(model=tokens[1])
+    elif tokens[0] == "anthropic":
+        os.environ["ANTHROPIC_API_KEY"] = st.secrets.anthropic_key
+        llm = Anthropic(model=tokens[1])
+    elif tokens[0] == "replicate":
+        os.environ["REPLICATE_API_KEY"] = st.secrets.replicate_key
+        llm = Replicate(model=tokens[1])
+    else:
+        raise ValueError(f"LLM {llm} not recognized.")
+    return llm
 
 
 ####################
@@ -61,9 +89,11 @@ def load_agent(
     tools: List, 
     llm: LLM, 
     system_prompt: str,
+    extra_kwargs: Optional[Dict] = None,
     **kwargs: Any
 ) -> BaseAgent:
     """Load agent."""
+    extra_kwargs = extra_kwargs or {}
     if isinstance(llm, OpenAI) and is_function_calling_model(llm.model):
         # get OpenAI Agent
         agent = OpenAIAgent.from_tools(
@@ -73,14 +103,15 @@ def load_agent(
             **kwargs
         )
     else:
-        agent = ReActAgent.from_tools(
-            tools=tools,
-            llm=llm,
-            react_chat_formatter=ReActChatFormatter(
-                system_header=system_prompt,
-            ),
-            **kwargs
+        if "vector_index" not in extra_kwargs:
+            raise ValueError("Must pass in vector index for CondensePlusContextChatEngine.")
+        vector_index = cast(VectorStoreIndex, extra_kwargs["vector_index"])
+        rag_params = cast(RAGParams, extra_kwargs["rag_params"])
+        # use condense + context chat engine
+        agent = CondensePlusContextChatEngine.from_defaults(
+            vector_index.as_retriever(similarity_top_k=rag_params.top_k),
         )
+        
     return agent
 
 
@@ -90,7 +121,7 @@ class RAGParams(BaseModel):
     Parameters used to configure a RAG pipeline.
     
     """
-    include_summarization: bool = Field(default=False, description="Whether to include summarization in the RAG pipeline.")
+    include_summarization: bool = Field(default=False, description="Whether to include summarization in the RAG pipeline. (only for GPT-4)")
     top_k: int = Field(default=2, description="Number of documents to retrieve from vector store.")
     chunk_size: int = Field(default=1024, description="Chunk size for vector store.")
     embed_model: str = Field(
@@ -143,7 +174,7 @@ class RAGAgentBuilder:
 
     def create_system_prompt(self, task: str) -> str:
         """Create system prompt for another agent given an input task."""
-        llm = OpenAI(model="gpt-4-1106-preview")
+        llm = BUILDER_LLM
         fmt_messages = GEN_SYS_PROMPT_TMPL.format_messages(task=task)
         response = llm.chat(fmt_messages)
         self._cache.system_prompt = response.message.content
@@ -247,7 +278,8 @@ class RAGAgentBuilder:
         embed_model = resolve_embed_model(rag_params.embed_model)
         # llm = resolve_llm(rag_params.llm)
         # TODO: use OpenAI for now
-        llm = OpenAI(model=rag_params.llm)
+        # llm = OpenAI(model=rag_params.llm)
+        llm = _resolve_llm(rag_params.llm)
 
         # first let's index the data with the right parameters
         service_context = ServiceContext.from_defaults(
@@ -287,7 +319,8 @@ class RAGAgentBuilder:
             return "System prompt not set yet. Please set system prompt first."
 
         agent = load_agent(
-            all_tools, llm=llm, system_prompt=self._cache.system_prompt, verbose=True
+            all_tools, llm=llm, system_prompt=self._cache.system_prompt, verbose=True,
+            extra_kwargs={"vector_index": vector_index, "rag_params": rag_params}
         )
 
         self._cache.agent = agent
